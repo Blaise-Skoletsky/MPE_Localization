@@ -14,12 +14,15 @@ All figures are saved under ``figures/presentation`` relative to this file.
 from __future__ import annotations
 
 import os
-from typing import Dict, Iterable, List, Sequence, Tuple
+import pickle
+from functools import lru_cache
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 from sklearn.metrics import mean_absolute_error
 
 from kNN_Model import (
@@ -27,15 +30,115 @@ from kNN_Model import (
 	fit_knn_model,
 	prepare_datasets,
 	load_real_combined,
+	load_paired_csvs,
+	load_meta,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
+MODELS_DIR = os.path.join(BASE_DIR, 'models')
 SYNTHETIC_PATH = os.path.join(BASE_DIR, 'synthetic_data', 'synthetic_knn_points.csv')
 FIG_DIR = os.path.join(BASE_DIR, 'figures', 'presentation')
+OLD_WIFI_PRE = os.path.join(DATA_DIR, 'old_wifi_cleaned.csv')
+NEW_WIFI_PRE = os.path.join(DATA_DIR, 'wifi_pre_pca.csv')
+OLD_LIGHT_CLEAN = os.path.join(DATA_DIR, 'old_light_cleaned.csv')
+NEW_WIFI_CLEAN = os.path.join(DATA_DIR, 'wifi_cleaned.csv')
+NEW_LIGHT_CLEAN = os.path.join(DATA_DIR, 'light_cleaned.csv')
+WIFI_SCALER_PATH = os.path.join(MODELS_DIR, 'spatial_wifi_scaler.pkl')
+LIGHT_SCALER_PATH = os.path.join(MODELS_DIR, 'spatial_light_scaler.pkl')
 os.makedirs(FIG_DIR, exist_ok=True)
 
 sns.set_theme(style='whitegrid')
+
+
+def _base_wifi_name(col: str) -> str:
+	return col[5:] if col.startswith('wifi_') else col
+
+
+def _base_light_name(col: str) -> str:
+	return col[6:] if col.startswith('light_') else col
+
+
+@lru_cache(maxsize=1)
+def _load_wifi_scaler_payload() -> Tuple[Dict[str, float], Dict[str, float], Optional[float], Optional[float]]:
+	if not os.path.exists(WIFI_SCALER_PATH):
+		raise FileNotFoundError(f"Missing wifi scaler metadata at {WIFI_SCALER_PATH}")
+	with open(WIFI_SCALER_PATH, 'rb') as sf:
+		payload = pickle.load(sf)
+	means = { _base_wifi_name(k): float(v) for k, v in payload.get('means', {}).items() }
+	stds = { _base_wifi_name(k): (float(v) if float(v) != 0 else 1.0) for k, v in payload.get('stds', {}).items() }
+	global_min = payload.get('global_min')
+	global_max = payload.get('global_max')
+	return (
+		means,
+		stds,
+		float(global_min) if global_min is not None else None,
+		float(global_max) if global_max is not None else None,
+	)
+
+
+@lru_cache(maxsize=1)
+def _load_light_scaler_payload() -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
+	if not os.path.exists(LIGHT_SCALER_PATH):
+		raise FileNotFoundError(f"Missing light scaler metadata at {LIGHT_SCALER_PATH}")
+	with open(LIGHT_SCALER_PATH, 'rb') as lf:
+		payload = pickle.load(lf)
+	mins = {str(k): float(v) for k, v in payload.get('mins', {}).items()}
+	maxs = {str(k): float(v) for k, v in payload.get('maxs', {}).items()}
+	means = {str(k): float(v) for k, v in payload.get('means', {}).items()}
+	stds = {str(k): (float(v) if float(v) != 0 else 1.0) for k, v in payload.get('stds', {}).items()}
+	return mins, maxs, means, stds
+
+
+def standardize_wifi_with_metadata(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+	"""Apply the stored min/max + z-score stats to a *raw* wifi dataframe."""
+	if df.empty:
+		raise ValueError('Wifi dataframe is empty; cannot standardize')
+	means, stds, global_min, global_max = _load_wifi_scaler_payload()
+	result = df.copy()
+	if global_min is None or global_max is None or global_max == global_min:
+		raise ValueError('Wifi scaler metadata lacks valid global min/max; cannot standardize')
+	denom = global_max - global_min
+	if denom == 0:
+		raise ValueError('Wifi scaler metadata produced invalid denominator; cannot standardize')
+	fill_value = global_min if global_min is not None else 0.0
+	for feat in features:
+		if feat not in result.columns:
+			raise KeyError(f"Wifi column '{feat}' missing; cannot standardize")
+		base = _base_wifi_name(feat)
+		series = result[feat].astype(float)
+		series = series.fillna(fill_value)
+		series = (series - fill_value) / denom
+		mean = means.get(base)
+		std = stds.get(base, 1.0) or 1.0
+		if mean is not None:
+			series = (series - mean) / std
+		result[feat] = series
+	return result
+
+
+def standardize_light_with_metadata(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+	if df.empty:
+		raise ValueError('Light dataframe is empty; cannot standardize')
+	mins, maxs, means, stds = _load_light_scaler_payload()
+	result = df.copy()
+	for feat in features:
+		if feat not in result.columns:
+			raise KeyError(f"Light column '{feat}' missing; cannot standardize")
+		base = _base_light_name(feat)
+		col_min = mins.get(base)
+		col_max = maxs.get(base)
+		if col_min is None or col_max is None or col_max == col_min:
+			raise ValueError(f"Light scaler stats invalid for column '{base}'")
+		series = result[feat].astype(float).fillna(col_min)
+		series = (series - col_min) / (col_max - col_min)
+		mean = means.get(base)
+		std = stds.get(base, 1.0)
+		if mean is None or std is None or std == 0:
+			raise ValueError(f"Light standardization stats missing for column '{base}'")
+		series = (series - mean) / std
+		result[feat] = series
+	return result
 
 
 def _save_current_fig(name: str) -> None:
@@ -107,7 +210,7 @@ def plot_wifi_null_summary(wifi_csv_path: str, top_n: int = 25) -> None:
 
 	plt.figure(figsize=(14, 6))
 	plt.subplot(1, 2, 1)
-	sns.barplot(x=top_series.values * 100, y=top_series.index, palette='viridis')
+	sns.barplot(x=top_series.values * 100, y=top_series.index, color='tab:green')
 	plt.title(f'Top {min(top_n, len(top_series))} WiFi columns by % null')
 	plt.xlabel('Null Percentage (%)')
 	plt.ylabel('WiFi Column')
@@ -152,6 +255,267 @@ def plot_real_vs_synth_distributions(real_df: pd.DataFrame, synth_df: pd.DataFra
 	plt.close()
 
 
+def build_wifi_pre_feature_list() -> List[str]:
+	wifi_cols = load_meta('wifi', subset='pre')
+	features: List[str] = []
+	for col in wifi_cols:
+		base = col
+		if col.startswith('wifi_'):
+			base = col[5:]
+		features.append(f'wifi_{base}')
+	return features
+
+
+def build_light_feature_list() -> List[str]:
+	light_cols = load_meta('light')
+	features: List[str] = []
+	for col in light_cols:
+		base = col
+		if col.startswith('light_'):
+			base = col[6:]
+		features.append(f'light_{base}')
+	return features
+
+
+def load_wifi_pre_dataset(path: str, features: List[str]) -> pd.DataFrame:
+	if not os.path.exists(path):
+		raise FileNotFoundError(f"Missing wifi pre-PCA file: {path}")
+	df = pd.read_csv(path)
+	if 'x' not in df.columns or 'y' not in df.columns:
+		raise ValueError(f"wifi dataset at {path} lacks x/y columns")
+	result = df[['x', 'y']].copy()
+	col_payload: Dict[str, pd.Series] = {}
+	for feat in features:
+		base = feat[5:]
+		if feat in df.columns:
+			col_payload[feat] = df[feat]
+		elif base in df.columns:
+			col_payload[feat] = df[base]
+		else:
+			raise KeyError(f"wifi column '{base}' missing from {path}")
+	if col_payload:
+		result = pd.concat([result, pd.DataFrame(col_payload)], axis=1)
+	return result
+
+
+def load_light_dataset(path: str, features: List[str]) -> pd.DataFrame:
+	if not os.path.exists(path):
+		raise FileNotFoundError(f"Missing light file: {path}")
+	df = pd.read_csv(path)
+	if 'x' not in df.columns or 'y' not in df.columns:
+		raise ValueError(f"light dataset at {path} lacks x/y columns")
+	result = df[['x', 'y']].copy()
+	col_payload: Dict[str, pd.Series] = {}
+	for feat in features:
+		base = _base_light_name(feat)
+		if feat in df.columns:
+			col_payload[feat] = df[feat]
+		elif base in df.columns:
+			col_payload[feat] = df[base]
+		else:
+			raise KeyError(f"light column '{base}' missing from {path}")
+	if col_payload:
+		result = pd.concat([result, pd.DataFrame(col_payload)], axis=1)
+	return result
+
+
+def load_combined_dataset(wifi_path: str, light_path: str) -> pd.DataFrame:
+	if not os.path.exists(wifi_path) or not os.path.exists(light_path):
+		print(f"Missing combined dataset files: {wifi_path}, {light_path}")
+		return pd.DataFrame()
+	return load_paired_csvs(wifi_path, light_path)
+
+
+
+def compute_old_vs_new_differences() -> Tuple[pd.DataFrame, List[str]]:
+	wifi_features = build_wifi_pre_feature_list()
+	light_features = build_light_feature_list()
+	new_wifi = load_wifi_pre_dataset(NEW_WIFI_PRE, wifi_features)
+	new_light = load_light_dataset(NEW_LIGHT_CLEAN, light_features)
+	old_wifi = load_wifi_pre_dataset(OLD_WIFI_PRE, wifi_features)
+	old_light = load_light_dataset(OLD_LIGHT_CLEAN, light_features)
+	old_wifi = standardize_wifi_with_metadata(old_wifi, wifi_features)
+	old_light = standardize_light_with_metadata(old_light, light_features)
+	new_combined = pd.merge(new_wifi, new_light, on=['x', 'y'], how='inner')
+	old_combined = pd.merge(old_wifi, old_light, on=['x', 'y'], how='inner')
+	features = wifi_features + light_features
+	merged = pd.merge(
+		new_combined[['x', 'y'] + features],
+		old_combined[['x', 'y'] + features],
+		on=['x', 'y'],
+		suffixes=('_new', '_old'),
+	)
+	if merged.empty:
+		raise ValueError('No overlapping (x,y) coordinates between old and new datasets.')
+	available = [feat for feat in features if f'{feat}_new' in merged.columns and f'{feat}_old' in merged.columns]
+	return merged, available
+
+
+def plot_feature_shift_summary(
+	merged: pd.DataFrame,
+	features: List[str],
+	label: str,
+	top_n: int = 10,
+) -> Tuple[List[str], pd.DataFrame]:
+	if merged.empty:
+		return [], pd.DataFrame()
+	shift_rows = []
+	for feat in features:
+		new_col = f'{feat}_new'
+		old_col = f'{feat}_old'
+		if new_col not in merged.columns or old_col not in merged.columns:
+			continue
+		if merged[new_col].isna().all() and merged[old_col].isna().all():
+			continue
+		diff = merged[new_col] - merged[old_col]
+		shift_rows.append({
+			'feature': feat,
+			'domain': 'wifi' if feat.startswith('wifi_') else 'light',
+			'mean_abs_diff': float(np.nanmean(np.abs(diff))),
+			'median_diff': float(np.nanmedian(diff)),
+		})
+	shift_df = pd.DataFrame(shift_rows).sort_values('mean_abs_diff', ascending=False)
+	if shift_df.empty:
+		print('No overlapping feature columns for old/new comparison.')
+		return [], shift_df
+	top_feats = shift_df.head(top_n)
+	plt.figure(figsize=(12, 7))
+	sns.barplot(data=top_feats, x='mean_abs_diff', y='feature', hue='domain', dodge=False)
+	plt.title(f'Top feature shifts between old and new datasets (by mean |Δ|) [{label}]')
+	plt.xlabel('Mean absolute difference')
+	plt.ylabel('Feature')
+	_save_current_fig(f'old_vs_new_feature_shift_{label}.png')
+	plt.close()
+	return top_feats['feature'].tolist(), shift_df
+
+
+def plot_shift_overview_histogram(shift_df: pd.DataFrame, label: str) -> None:
+	if shift_df.empty:
+		return
+	edges = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, np.inf]
+	labels = []
+	for idx in range(len(edges) - 1):
+		start = edges[idx]
+		end = edges[idx + 1]
+		if np.isinf(end):
+			labels.append(f'>= {start:.2f}')
+		else:
+			labels.append(f'{start:.2f}-{end:.2f}')
+	shift_df = shift_df.copy()
+	shift_df['mae_bin'] = pd.cut(
+		shift_df['mean_abs_diff'],
+		edges,
+		labels=labels,
+		include_lowest=True,
+		right=False,
+	)
+	overview = shift_df['mae_bin'].value_counts().reindex(labels, fill_value=0).reset_index()
+	overview.columns = ['bin', 'count']
+	plt.figure(figsize=(12, 5))
+	sns.barplot(data=overview, x='bin', y='count', color='tab:blue')
+	plt.xticks(rotation=45, ha='right')
+	plt.xlabel('Mean absolute difference bucket (|Δ|)')
+	plt.ylabel('Feature count')
+	plt.title(f'Feature shift distribution by |Δ| bucket [{label}]')
+	_save_current_fig(f'old_vs_new_feature_shift_overview_{label}.png')
+	plt.close()
+
+
+def plot_full_feature_shift_chart(shift_df: pd.DataFrame, label: str) -> None:
+	if shift_df.empty:
+		return
+	sorted_df = shift_df.sort_values('mean_abs_diff', ascending=False)
+	fig_height = max(6, len(sorted_df) * 0.18)
+	plt.figure(figsize=(12, fig_height))
+	sns.barplot(data=sorted_df, x='mean_abs_diff', y='feature', hue='domain', dodge=False)
+	plt.xlabel('Mean absolute difference (|Δ|)')
+	plt.ylabel('Feature')
+	plt.title(f'Per-feature distribution shift overview [{label}]')
+	plt.legend(title='Domain', loc='upper right')
+	plt.tight_layout()
+	_save_current_fig(f'old_vs_new_feature_shift_full_{label}.png')
+	plt.close()
+
+
+
+def plot_feature_distribution_overlays(
+	merged: pd.DataFrame,
+	features: List[str],
+	selected_features: List[str],
+	label: str,
+	suffix: str = 'top',
+	max_plots: int = 6,
+) -> None:
+	if merged.empty or not selected_features:
+		return
+	plot_feats = selected_features[:max_plots]
+	n_cols = 2
+	n_rows = int(np.ceil(len(plot_feats) / n_cols))
+	plt.figure(figsize=(12, 4 * n_rows))
+	for idx, feat in enumerate(plot_feats, start=1):
+		plt.subplot(n_rows, n_cols, idx)
+		new_vals = merged[f'{feat}_new'].dropna()
+		old_vals = merged[f'{feat}_old'].dropna()
+		if not new_vals.empty:
+			sns.kdeplot(new_vals, label='New dataset', fill=True)
+		if not old_vals.empty:
+			sns.kdeplot(old_vals, label='Old dataset', fill=True)
+		plt.title(f'{feat} distribution shift')
+		plt.xlabel(feat)
+		if idx == 1:
+			plt.legend()
+	_save_current_fig(f'old_vs_new_distributions_{suffix}_{label}.png')
+	plt.close()
+
+
+def plot_feature_difference_map(merged: pd.DataFrame, features: List[str], label: str) -> None:
+	if merged.empty:
+		return
+	print("1")
+	diff_df = merged[['x', 'y']].copy()
+	abs_diff_payload: Dict[str, pd.Series] = {}
+	for feat in features:
+		new_col = f'{feat}_new'
+		old_col = f'{feat}_old'
+		if new_col not in merged.columns or old_col not in merged.columns:
+			continue
+		col_name = f'{feat}_abs_diff'
+		abs_diff_payload[col_name] = np.abs(merged[new_col] - merged[old_col])
+	if not abs_diff_payload:
+		return
+	print("2")
+	diff_df = pd.concat([diff_df, pd.DataFrame(abs_diff_payload)], axis=1)
+	feature_cols = list(abs_diff_payload.keys())
+	diff_df['mean_abs_diff'] = diff_df[feature_cols].mean(axis=1)
+	vmax = float(diff_df['mean_abs_diff'].max()) if feature_cols else 0.0
+	if not np.isfinite(vmax) or vmax == 0:
+		vmax = 0.5
+	clamped_vmax = max(0.5, min(1.0, vmax))
+	print("3")
+	norm = Normalize(vmin=0.0, vmax=clamped_vmax)
+	print("4")
+	plt.figure(figsize=(8, 6))
+	sc = plt.scatter(diff_df['x'], diff_df['y'], c=diff_df['mean_abs_diff'], cmap='magma', s=50, edgecolor='none', norm=norm)
+	for x, y, val in zip(diff_df['x'], diff_df['y'], diff_df['mean_abs_diff']):
+		plt.text(x, y + 8, f"{val:.2f}", color='black', ha='center', va='bottom', fontsize=8)
+	plt.colorbar(sc, label='Mean |Δfeature| across modalities')
+	plt.title(f'Spatial map of feature drift (old vs new) [{label}]')
+	plt.xlabel('X (cm)')
+	plt.ylabel('Y (cm)')
+	_save_current_fig(f'old_vs_new_spatial_drift_{label}.png')
+	plt.close()
+
+
+def run_feature_drift_pipeline(label: str) -> None:
+	merged_df, overlap_features = compute_old_vs_new_differences()
+	#if merged_df.empty or not overlap_features:
+	#		return
+	#top_features, shift_df = plot_feature_shift_summary(merged_df, overlap_features, label=label, top_n=6)
+	#plot_full_feature_shift_chart(shift_df, label)
+	#plot_shift_overview_histogram(shift_df, label)
+	#if top_features:
+	#		plot_feature_distribution_overlays(merged_df, overlap_features, top_features, label=label, suffix='top', max_plots=6)
+	plot_feature_difference_map(merged_df, overlap_features, label=label)
 
 def train_baseline_model(
 	frac: float = 0.4,
@@ -278,36 +642,39 @@ def main() -> None:
 	real_fracs = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
 	k_values = list(range(1, 26, 2))
 
-	print('Running hyperparameter sweeps...')
-	hp_df = run_hyperparameter_search(real_fracs, k_values)
-	plot_hyperparameter_search(hp_df)
+	#print('Running hyperparameter sweeps...')
+	#hp_df = run_hyperparameter_search(real_fracs, k_values)
+	#plot_hyperparameter_search(hp_df)
+#
+	#print('Plotting wifi null percentages...')
+	#wifi_csv = os.path.join(DATA_DIR, 'wifi.csv')
+	#plot_wifi_null_summary(wifi_csv)
+#
+	#print('Comparing real vs synthetic distributions...')
+	#real_df = load_real_combined()
+	#synth_df = pd.read_csv(SYNTHETIC_PATH) if os.path.exists(SYNTHETIC_PATH) else pd.DataFrame()
+	#plot_real_vs_synth_distributions(real_df, synth_df)
 
-	print('Plotting wifi null percentages...')
-	wifi_csv = os.path.join(DATA_DIR, 'wifi.csv')
-	plot_wifi_null_summary(wifi_csv)
+	print('Analyzing historical (old vs new) feature drift (standardized view only)...')
+	run_feature_drift_pipeline(label='standardized')
 
-	print('Comparing real vs synthetic distributions...')
-	real_df = load_real_combined()
-	synth_df = pd.read_csv(SYNTHETIC_PATH) if os.path.exists(SYNTHETIC_PATH) else pd.DataFrame()
-	plot_real_vs_synth_distributions(real_df, synth_df)
+	#print('Training baseline model and evaluating on real test split...')
+	#model, features, real_results, real_preds = train_baseline_model()
+	#plot_accuracy_map(real_results, 'accuracy_map_real.png', 'Spatial accuracy (real test set)')
+	#plot_error_heatmap(real_results, 'accuracy_heatmap_real.png', 'Mean error heatmap (real test set)')
+	#plot_error_histogram(real_results['error_cm'], 'real')
+	#plot_pred_vs_true(real_preds, 'real')
 
-	print('Training baseline model and evaluating on real test split...')
-	model, features, real_results, real_preds = train_baseline_model()
-	plot_accuracy_map(real_results, 'accuracy_map_real.png', 'Spatial accuracy (real test set)')
-	plot_error_heatmap(real_results, 'accuracy_heatmap_real.png', 'Mean error heatmap (real test set)')
-	plot_error_histogram(real_results['error_cm'], 'real')
-	plot_pred_vs_true(real_preds, 'real')
-
-	if not synth_df.empty:
-		print('Evaluating baseline model on synthetic dataset...')
-		synth_results, synth_preds = evaluate_on_dataframe(model, features, synth_df, 'synthetic')
-		plot_accuracy_map(synth_results, 'accuracy_map_synthetic.png', 'Spatial accuracy (synthetic samples)')
-		plot_error_heatmap(synth_results, 'accuracy_heatmap_synthetic.png', 'Mean error heatmap (synthetic samples)')
-		plot_error_histogram(synth_results['error_cm'], 'synthetic')
-		plot_pred_vs_true(synth_preds, 'synthetic')
-	else:
-		print('Synthetic dataset not found; skipping synthetic evaluation plots.')
-
+	#if not synth_df.empty:
+	#	print('Evaluating baseline model on synthetic dataset...')
+	#	synth_results, synth_preds = evaluate_on_dataframe(model, features, synth_df, 'synthetic')
+	#	plot_accuracy_map(synth_results, 'accuracy_map_synthetic.png', 'Spatial accuracy (synthetic samples)')
+	#	plot_error_heatmap(synth_results, 'accuracy_heatmap_synthetic.png', 'Mean error heatmap (synthetic samples)')
+	#	plot_error_histogram(synth_results['error_cm'], 'synthetic')
+	#	plot_pred_vs_true(synth_preds, 'synthetic')
+	#else:
+	#	print('Synthetic dataset not found; skipping synthetic evaluation plots.')
+#
 	print('All figures saved under:', FIG_DIR)
 
 
